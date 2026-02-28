@@ -1,0 +1,94 @@
+{
+  "version": "v7",
+  "runtime_seconds": 208.78,
+  "data": {
+    "train_rows": 221,
+    "test_rows": 95,
+    "features": 93
+  },
+  "selected_survival_models": [
+    {
+      "name": "GBSA",
+      "cv_mean_h": 0.9724385484236493,
+      "cv_std_h": 0.009674287530841916,
+      "cv_mean_c": 0.9520442786279688,
+      "cv_mean_wb": 0.018821050235344954,
+      "robust": 0.9695362621643967,
+      "params": {
+        "n_estimators": 500,
+        "learning_rate": 0.08,
+        "max_depth": 2,
+        "subsample": 0.6,
+        "min_samples_leaf": 20
+      }
+    },
+    {
+      "name": "ExtraTrees",
+      "cv_mean_h": 0.9687025069875477,
+      "cv_std_h": 0.011009241883255213,
+      "cv_mean_c": 0.9482025329410023,
+      "cv_mean_wb": 0.022511789849647305,
+      "robust": 0.9653997344225711,
+      "params": {
+        "n_estimators": 300,
+        "max_depth": 10,
+        "min_samples_leaf": 5,
+        "max_features": 0.7
+      }
+    },
+    {
+      "name": "RSF",
+      "cv_mean_h": 0.9683803888934813,
+      "cv_std_h": 0.010882455360427416,
+      "cv_mean_c": 0.9475376487067594,
+      "cv_mean_wb": 0.022687008169352277,
+      "robust": 0.9651156522853531,
+      "params": {
+        "n_estimators": 500,
+        "max_depth": 7,
+        "min_samples_leaf": 3,
+        "max_features": 0.25
+      }
+    }
+  ],
+  "ipcw_lgbm": {
+    "cv_h": 0.9685940616730726,
+    "cv_c": 0.941118336732709,
+    "cv_wb": 0.01963062763820022,
+    "params": {
+      "n_estimators": 200,
+      "learning_rate": 0.05,
+      "max_depth": 3,
+      "num_leaves": 8,
+      "min_child_samples": 30,
+      "subsample": 1.0,
+      "colsample_bytree": 0.9,
+      "reg_lambda": 1.0
+    }
+  },
+  "blend_weights": {
+    "GBSA": 0.002592605959092849,
+    "ExtraTrees": 0.015047203847083338,
+    "RSF": 0.0033091994506980267,
+    "IPCW-LGB": 0.9790509907431257
+  },
+  "blend_cv": {
+    "mean_h": 0.9732005978948741,
+    "std_h": 0.01387763380357384,
+    "mean_c": 0.956445421827883,
+    "mean_wb": 0.01961861236212956
+  },
+  "calibration": {
+    "chosen": "none",
+    "scores": {
+      "none": 0.9732005978948741,
+      "clipped": 0.9732005961939206,
+      "isotonic": 0.9704495901378621,
+      "platt": 0.9688301986296357
+    }
+  },
+  "output_files": [
+    "submission.csv",
+    "submission_blend.csv"
+  ]
+}
