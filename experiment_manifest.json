@@ -1,6 +1,6 @@
 {
   "version": "v7",
-  "runtime_seconds": 208.78,
+  "runtime_seconds": 196.95,
   "data": {
     "train_rows": 221,
     "test_rows": 95,

@@ -1,171 +1,221 @@
 #!/usr/bin/env python3
 """
-WiDS Global Datathon 2026 - Advanced Survival Pipeline (v7)
-============================================================
-Maximises: hybrid = 0.3 * C-index + 0.7 * (1 - weighted_brier)
-WB weights: 30% at 24h, 40% at 48h, 30% at 72h.
+WiDS Global Datathon 2026 – v8s (v8 + stacking)
+=================================================
 
-v7 improvements:
-  1. 93 features (81 base + 12 binary tracking quality + interaction terms)
-  2. IPCW-weighted LightGBM for direct P(T<=t) optimisation at each horizon
-  3. Two-stage adaptive search (StratifiedKFold, faster)
-  4. Multi-seed OOF averaging (3 seeds)
-  5. Nelder-Mead blend: GBSA + RSF + ExtraTrees + IPCW-LGB
-  6. Leave-fold-out calibration: none / clipped / isotonic / platt
+Proven v8 base (0.96394 on public LB) + minimal LightGBM stacking.
+NO changes to feature engineering, model configs, or feature selection.
 
-Install: pip install pandas numpy scikit-survival scikit-learn scipy lightgbm
-Run:     /opt/anaconda3/bin/python3 wids_datathon.py
+Install
+-------
+    pip install pandas numpy scikit-survival scikit-learn scipy xgboost lightgbm
+
+Run
+---
+    /opt/anaconda3/bin/python3 wids_datathon.py
 """
+
 from __future__ import annotations
-import itertools, json, sys, time, warnings
+
+import gc
+import itertools
+import json
+import sys
+import time
+import warnings
 from pathlib import Path
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from scipy.optimize import minimize
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+)
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sksurv.ensemble import ExtraSurvivalTrees, GradientBoostingSurvivalAnalysis, RandomSurvivalForest
-from sksurv.metrics import brier_score, concordance_index_censored
-from sksurv.nonparametric import kaplan_meier_estimator
+from sksurv.ensemble import (
+    GradientBoostingSurvivalAnalysis,
+    RandomSurvivalForest,
+)
+from sksurv.linear_model import CoxPHSurvivalAnalysis
+from sksurv.metrics import concordance_index_censored
+
 warnings.filterwarnings("ignore")
 
 RANDOM_STATE = 42
-PRED_TIMES   = np.array([12.0, 24.0, 48.0, 72.0])
-BRIER_TIMES  = np.array([24.0, 48.0, 72.0])
-BRIER_W      = np.array([0.3, 0.4, 0.3])
-N_FOLDS      = 5
-PROB_FLOOR   = 0.001
-PROB_CEIL    = 0.999
-OOF_SEEDS    = [42, 123, 789]
-FINAL_SEEDS  = [42, 123, 456, 789, 2024, 314, 271]
+PRED_TIMES = np.array([12.0, 24.0, 48.0, 72.0])
+BRIER_TIMES = np.array([24.0, 48.0, 72.0])
+BRIER_W = np.array([0.3, 0.4, 0.3])
+N_FOLDS = 5
+FINAL_SEEDS = [42, 123, 456, 789, 2024]
+PROB_FLOOR = 0.003
+PROB_CEIL = 0.997
 
-DATA_DIR   = Path(__file__).resolve().parent
-TRAIN_P    = DATA_DIR / "train.csv"
-TEST_P     = DATA_DIR / "test.csv"
-SAMPLE_P   = DATA_DIR / "sample_submission.csv"
-MANIFEST_P = DATA_DIR / "experiment_manifest.json"
-ID_COL  = "event_id"
+DATA_DIR = Path(__file__).resolve().parent
+TRAIN_P = DATA_DIR / "train.csv"
+TEST_P = DATA_DIR / "test.csv"
+SAMPLE_P = DATA_DIR / "sample_submission.csv"
+ID_COL = "event_id"
 TARGETS = ["event", "time_to_hit_hours"]
 
-# ─── Feature engineering ──────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════
+# Feature Engineering  (EXACT v8 — do NOT modify)
+# ═══════════════════════════════════════════════════════════════════════
 
 def engineer(df: pd.DataFrame) -> pd.DataFrame:
-    """Base 81-feature set (34 raw CSV + 47 derived)."""
     d = df.copy()
-    dist   = d["dist_min_ci_0_5h"]
-    spd    = d["closing_speed_m_per_h"]
-    aspd   = d["closing_speed_abs_m_per_h"]
-    area   = d["area_first_ha"]
-    gr     = d["area_growth_rate_ha_per_h"]
-    rad    = d["radial_growth_rate_m_per_h"]
-    aln    = d["alignment_abs"]
-    alc    = d["alignment_cos"]
-    along  = d["along_track_speed"]
-    cspd   = d["centroid_speed_m_per_h"]
+    dist = d["dist_min_ci_0_5h"]
+    spd = d["closing_speed_m_per_h"]
+    aspd = d["closing_speed_abs_m_per_h"]
+    area = d["area_first_ha"]
+    gr = d["area_growth_rate_ha_per_h"]
+    rad = d["radial_growth_rate_m_per_h"]
+    aln = d["alignment_abs"]
+    alc = d["alignment_cos"]
+    along = d["along_track_speed"]
+    cspd = d["centroid_speed_m_per_h"]
     dslope = d["dist_slope_ci_0_5h"]
-    dstd   = d["dist_std_ci_0_5h"]
+    dstd = d["dist_std_ci_0_5h"]
     daccel = d["dist_accel_m_per_h2"]
-    r2     = d["dist_fit_r2_0_5h"]
-    proj   = d["projected_advance_m"]
-    dt     = d["dt_first_last_0_5h"]
-    nper   = d["num_perimeters_0_5h"]
+    r2 = d["dist_fit_r2_0_5h"]
+    proj = d["projected_advance_m"]
+    dt = d["dt_first_last_0_5h"]
+    nper = d["num_perimeters_0_5h"]
+    cross = d["cross_track_component"]
+
     safe_spd = spd.replace(0, np.nan)
     safe_rad = rad.replace(0, np.nan)
-    d["eta_close"]        = (dist / safe_spd).clip(-500, 500).fillna(999)
-    d["eta_radial"]       = (dist / safe_rad).clip(-500, 500).fillna(999)
-    d["risk_proxy"]       = spd * aln / (dist + 1.0)
-    d["risk_proxy_sq"]    = d["risk_proxy"] ** 2
-    d["risk_area_dist"]   = area / (dist + 1.0)
-    d["log_dist"]         = np.log1p(dist)
-    d["log_area"]         = np.log1p(area)
-    d["sqrt_area"]        = np.sqrt(area)
-    d["sqrt_dist"]        = np.sqrt(dist)
-    d["area_x_growth"]    = area * gr
-    d["fire_intensity"]   = np.sqrt(area + 1) * gr
-    d["radial_x_area"]    = rad * np.sqrt(area + 1)
+    safe_dt = dt.replace(0, np.nan)
+
+    d["eta_close"] = (dist / safe_spd).clip(-500, 500).fillna(999)
+    d["eta_radial"] = (dist / safe_rad).clip(-500, 500).fillna(999)
+
+    d["risk_proxy"] = spd * aln / (dist + 1.0)
+    d["risk_proxy_sq"] = d["risk_proxy"] ** 2
+    d["risk_area_dist"] = area / (dist + 1.0)
+    d["risk_composite"] = (spd * aln * area) / (dist ** 2 + 1.0)
+
+    d["log_dist"] = np.log1p(dist)
+    d["log_area"] = np.log1p(area)
+    d["sqrt_area"] = np.sqrt(area)
+    d["sqrt_dist"] = np.sqrt(dist)
+    d["log_spd"] = np.log1p(aspd)
+
+    d["area_x_growth"] = area * gr
+    d["fire_intensity"] = np.sqrt(area + 1) * gr
+    d["radial_x_area"] = rad * np.sqrt(area + 1)
+
     for h in [12, 24, 48, 72]:
-        d[f"reach_{h}"]   = rad * h
+        d[f"reach_{h}"] = rad * h
         d[f"deficit_{h}"] = dist - spd * h
-        d[f"phit_{h}"]    = (dist < spd * h).astype(float)
-    d["close_frac"]       = spd / (dist + 1.0)
-    d["rad_frac"]         = rad / (dist + 1.0)
-    d["spd_ratio_rc"]     = rad / (aspd + 1.0)
-    d["spd_ratio_cc"]     = spd / (cspd + 1.0)
-    d["dir_momentum"]     = along * aln
-    d["align_x_speed"]    = alc * spd
-    d["cross_abs"]        = d["cross_track_component"].abs()
-    d["perim_dens"]       = (nper / dt.replace(0, np.nan)).fillna(0)
-    d["adv_ratio"]        = proj / (dist + 1.0)
-    d["accel_24"]         = spd + daccel * 24
-    d["accel_48"]         = spd + daccel * 48
-    d["rel_close"]        = spd * r2
-    d["close_sq"]         = spd ** 2
-    d["dist_sq"]          = dist ** 2
-    d["hr_sin"]           = np.sin(2 * np.pi * d["event_start_hour"] / 24)
-    d["hr_cos"]           = np.cos(2 * np.pi * d["event_start_hour"] / 24)
-    d["mo_sin"]           = np.sin(2 * np.pi * d["event_start_month"] / 12)
-    d["mo_cos"]           = np.cos(2 * np.pi * d["event_start_month"] / 12)
-    d["dstd_x_close"]     = dstd * spd
-    d["slope_x_align"]    = dslope * aln
-    d["slope_x_speed"]    = dslope * spd
-    d["dist_x_align"]     = dist * aln
+        d[f"phit_{h}"] = (dist < spd * h).astype(float)
+        d[f"eta_frac_{h}"] = (dist / (safe_spd * h + 1)).clip(0, 10).fillna(10)
+        d[f"accel_{h}"] = spd + daccel * h
+
+    d["close_frac"] = spd / (dist + 1.0)
+    d["rad_frac"] = rad / (dist + 1.0)
+    d["spd_ratio_rc"] = rad / (aspd + 1.0)
+    d["spd_ratio_cc"] = spd / (cspd + 1.0)
+
+    d["dir_momentum"] = along * aln
+    d["align_x_speed"] = alc * spd
+    d["cross_abs"] = cross.abs()
+    d["align_x_close_frac"] = alc * spd / (dist + 1.0)
+
+    d["perim_dens"] = (nper / safe_dt).fillna(0)
+    d["adv_ratio"] = proj / (dist + 1.0)
+
+    d["rel_close"] = spd * r2
+    d["close_sq"] = spd ** 2
+    d["dist_sq"] = dist ** 2
+
+    d["hr_sin"] = np.sin(2 * np.pi * d["event_start_hour"] / 24)
+    d["hr_cos"] = np.cos(2 * np.pi * d["event_start_hour"] / 24)
+    d["mo_sin"] = np.sin(2 * np.pi * d["event_start_month"] / 12)
+    d["mo_cos"] = np.cos(2 * np.pi * d["event_start_month"] / 12)
+
+    d["dstd_x_close"] = dstd * spd
+    d["slope_x_align"] = dslope * aln
+    d["slope_x_speed"] = dslope * spd
+    d["dist_x_align"] = dist * aln
     d["dist_change_norm"] = d["dist_change_ci_0_5h"] / (dist + 1.0)
+
+    d["perimeter_est"] = 2 * np.sqrt(np.pi * area)
+    d["fire_aspect"] = rad / (gr + 0.01)
+    d["spread_efficiency"] = proj / (cspd * safe_dt + 1).fillna(0)
+    d["r2_x_deficit_48"] = r2 * d["deficit_48"]
+    d["r2_x_risk"] = r2 * d["risk_proxy"]
+
     d.fillna(0, inplace=True)
     d.replace([np.inf, -np.inf], 0, inplace=True)
     return d
 
 
-def engineer_v7(df: pd.DataFrame) -> pd.DataFrame:
-    """Extended 93-feature set: 81 base + 12 new binary/interaction features.
-
-    EDA findings driving the additions:
-      - All events have dist < 5 km; all censored have dist >= 5 km.
-      - Well-tracked events (nper>=3, ltr=0) hit at mean 1.6 h; poorly-tracked at 14.8 h.
-      - Interaction terms capture group-specific feature effects for tree models.
-    """
-    d = engineer(df)
-    nper = df["num_perimeters_0_5h"].values
-    ltr  = df["low_temporal_resolution_0_5h"].values
-    dist = df["dist_min_ci_0_5h"].values
-    area = df["area_first_ha"].values
-    spd  = df["closing_speed_m_per_h"].values
-    aln  = df["alignment_abs"].values
-    hour = df["event_start_hour"].values
-    is_well = ((nper >= 3) & (ltr == 0)).astype(float)
-    d["is_well_tracked"]  = is_well
-    d["is_close_5km"]     = (dist < 5000).astype(float)
-    d["is_close_10km"]    = (dist < 10000).astype(float)
-    d["log_area_x_well"]  = np.log1p(area) * is_well
-    d["align_x_well"]     = aln * is_well
-    d["spd_x_well"]       = spd * is_well
-    d["hour_x_well"]      = hour * is_well
-    d["track_quality"]    = nper * (1.0 - ltr)
-    d["track_x_align"]    = d["track_quality"] * aln
-    safe_spd_v            = np.where(np.abs(spd) > 10, spd, 10.0)
-    d["time_est"]         = np.clip(dist / safe_spd_v, 0, 200)
-    d["is_very_close"]    = (dist < 1000).astype(float)
-    d["dist_log_bucket"]  = np.clip(np.floor(np.log10(np.maximum(dist, 1))), 0, 5)
-    d.fillna(0, inplace=True)
-    d.replace([np.inf, -np.inf], 0, inplace=True)
-    return d
-
+# ═══════════════════════════════════════════════════════════════════════
+# Data loading
+# ═══════════════════════════════════════════════════════════════════════
 
 def load_data():
-    tr   = pd.read_csv(TRAIN_P)
-    te   = pd.read_csv(TEST_P)
+    tr = pd.read_csv(TRAIN_P)
+    te = pd.read_csv(TEST_P)
     feat = [c for c in tr.columns if c not in TARGETS + [ID_COL]]
-    Xtr  = engineer_v7(tr[feat])
-    Xte  = engineer_v7(te[feat])
-    y    = np.array(
+    Xtr = engineer(tr[feat])
+    Xte = engineer(te[feat])
+    y_surv = np.array(
         list(zip(tr["event"].astype(bool), tr["time_to_hit_hours"].astype(float))),
         dtype=[("event", bool), ("time", float)],
     )
-    return Xtr, Xte, y, te[ID_COL].values
+    return Xtr, Xte, y_surv, te[ID_COL].values, tr
 
-# ─── Utilities ────────────────────────────────────────────────────────────────
+
+def make_binary_targets(train_df):
+    event = train_df["event"].values
+    tth = train_df["time_to_hit_hours"].values
+    return {t: ((event == 1) & (tth <= t)).astype(int) for t in PRED_TIMES}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Metric: Direct MSE Brier (matching competition scoring)
+# ═══════════════════════════════════════════════════════════════════════
+
+def mse_brier(probs, bin_targets_slice):
+    bs = []
+    for j, t in enumerate(BRIER_TIMES):
+        yt = bin_targets_slice[t]
+        p = probs[:, j + 1]
+        bs.append(float(np.mean((p - yt) ** 2)))
+    return float(np.average(bs, weights=BRIER_W))
+
+
+def hybrid_score(c_index, wb):
+    return 0.3 * c_index + 0.7 * (1.0 - wb)
+
+
+def eval_fold(y_va, probs_va, bt_va):
+    risk = probs_va[:, 3]
+    c = concordance_index_censored(y_va["event"], y_va["time"], risk)[0]
+    wb = mse_brier(probs_va, bt_va)
+    return {"c": c, "wb": wb, "h": hybrid_score(c, wb)}
+
+
+def eval_cv(y_surv, probs, bin_targets, skf):
+    ms = []
+    for _, va_i in skf.split(np.arange(len(y_surv)), y_surv["event"]):
+        bt_va = {t: bin_targets[t][va_i] for t in PRED_TIMES}
+        m = eval_fold(y_surv[va_i], probs[va_i], bt_va)
+        ms.append(m)
+    return ms
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
 
 def sf2prob(surv_fns, times=PRED_TIMES):
     n = len(surv_fns)
@@ -173,174 +223,23 @@ def sf2prob(surv_fns, times=PRED_TIMES):
     for i, sf in enumerate(surv_fns):
         xv, yv = sf.x, sf.y
         for j, t in enumerate(times):
-            if   t <= xv[0]: s = yv[0]
-            elif t >= xv[-1]: s = yv[-1]
-            else: s = yv[np.searchsorted(xv, t, side="right") - 1]
+            if t <= xv[0]:
+                s = yv[0]
+            elif t >= xv[-1]:
+                s = yv[-1]
+            else:
+                s = yv[np.searchsorted(xv, t, side="right") - 1]
             out[i, j] = 1.0 - s
     return out
+
 
 def mono(p):
     return np.maximum.accumulate(np.clip(p, 0.0, 1.0), axis=1)
 
+
 def clip_safe(p):
     return mono(np.clip(p, PROB_FLOOR, PROB_CEIL))
 
-def metric(y_tr, y_va, probs, risk):
-    c  = concordance_index_censored(y_va["event"], y_va["time"], risk)[0]
-    sv = 1.0 - probs[:, 1:]
-    eps = 0.01
-    hi  = min(y_tr["time"].max(), y_va["time"].max()) - eps
-    ok  = BRIER_TIMES < hi
-    et, ew, es = BRIER_TIMES[ok], BRIER_W[ok], sv[:, ok]
-    if len(et) == 0:
-        return {"c": c, "wb": np.nan, "h": np.nan}
-    try:
-        _, bs = brier_score(y_tr, y_va, es, et)
-    except ValueError:
-        hi2 = min(y_tr["time"].max(), y_va["time"].max()) * 0.99
-        ok2 = BRIER_TIMES < hi2
-        if not ok2.any():
-            return {"c": c, "wb": np.nan, "h": np.nan}
-        _, bs = brier_score(y_tr, y_va, sv[:, ok2], BRIER_TIMES[ok2])
-        ew    = BRIER_W[ok2]
-    wb = float(np.average(bs, weights=ew / ew.sum()))
-    return {"c": c, "wb": wb, "h": 0.3 * c + 0.7 * (1.0 - wb)}
-
-# ─── IPCW-LightGBM ────────────────────────────────────────────────────────────
-
-def km_censoring(event, time):
-    """G(t) = P(C > t) via Kaplan-Meier on the censoring process."""
-    t_km, g_km = kaplan_meier_estimator(~event.astype(bool), time)
-    return t_km, g_km
-
-def _g_at(t_km, g_km, t):
-    if t > t_km[-1]:
-        return max(float(g_km[-1]), 1e-6)
-    idx = int(np.searchsorted(t_km, t, side="right")) - 1
-    return max(float(g_km[max(idx, 0)]), 1e-6)
-
-def make_ipcw_dataset(X, event, time, horizon, t_km, g_km):
-    """Binary IPCW dataset for P(T <= horizon).
-    Excludes rows censored at or before horizon (ambiguous label).
-    IPCW weight = 1/G(t_i) for positive examples, capped at 20."""
-    mask  = event.astype(bool) | (time > horizon)
-    Xs    = X[mask]
-    y_bin = (event[mask] & (time[mask] <= horizon)).astype(float)
-    ws    = np.ones(len(Xs))
-    for i, oi in enumerate(np.where(mask)[0]):
-        if event[oi] and time[oi] <= horizon:
-            ws[i] = 1.0 / _g_at(t_km, g_km, time[oi])
-    return Xs, y_bin, np.clip(ws, 1.0, 20.0)
-
-_LGBM_FIXED = {"objective": "binary", "metric": "binary_logloss",
-               "verbose": -1, "n_jobs": 2}
-
-def train_lgbm_ipcw(X, event, time, horizon, params, seed=RANDOM_STATE):
-    t_km, g_km = km_censoring(event, time)
-    Xs, y_bin, ws = make_ipcw_dataset(X, event, time, horizon, t_km, g_km)
-    clf = lgb.LGBMClassifier(**{**_LGBM_FIXED, **params, "random_state": seed})
-    clf.fit(Xs, y_bin, sample_weight=ws)
-    return clf
-
-def oof_lgbm_ipcw(X_arr, y, params, splitter, seeds=None):
-    """OOF probabilities for IPCW-LGB across all four horizons."""
-    if seeds is None:
-        seeds = OOF_SEEDS
-    n, oof_p = len(y), np.zeros((len(y), 4))
-    for tr_i, va_i in splitter.split(np.arange(n), y["event"].astype(int)):
-        acc = np.zeros((len(va_i), 4))
-        for seed in seeds:
-            fp = np.zeros((len(va_i), 4))
-            for j, h in enumerate(PRED_TIMES):
-                clf = train_lgbm_ipcw(X_arr[tr_i], y["event"][tr_i],
-                                      y["time"][tr_i], h, params, seed=seed)
-                fp[:, j] = clf.predict_proba(X_arr[va_i])[:, 1]
-            acc += fp
-        oof_p[va_i] = acc / len(seeds)
-    oof_p = mono(oof_p)
-    return oof_p, oof_p[:, -1]
-
-def fit_predict_ipcw_test(X_arr, y, Xte_arr, params):
-    """Retrain IPCW-LGB on full training set; average over FINAL_SEEDS."""
-    preds = np.zeros((len(Xte_arr), 4))
-    for seed in FINAL_SEEDS:
-        fp = np.zeros((len(Xte_arr), 4))
-        for j, h in enumerate(PRED_TIMES):
-            clf = train_lgbm_ipcw(X_arr, y["event"], y["time"], h, params, seed=seed)
-            fp[:, j] = clf.predict_proba(Xte_arr)[:, 1]
-        preds += fp
-    return mono(preds / len(FINAL_SEEDS))
-
-# ─── IPCW-LGB search ──────────────────────────────────────────────────────────
-
-LGBM_GRID = {
-    "n_estimators":      [100, 200, 300, 500],
-    "learning_rate":     [0.03, 0.05, 0.08, 0.1],
-    "max_depth":         [3, 4, 5],
-    "num_leaves":        [8, 15, 31],
-    "min_child_samples": [20, 30, 50],
-    "subsample":         [0.7, 0.8, 1.0],
-    "colsample_bytree":  [0.7, 0.9, 1.0],
-    "reg_lambda":        [1.0, 5.0, 10.0],
-}
-
-def search_lgbm_ipcw(X_arr, y, splitter, n_draws=25):
-    """Random search for IPCW-LGB hyperparameters via OOF hybrid score."""
-    rng  = np.random.default_rng(RANDOM_STATE + 77)
-    keys = list(LGBM_GRID)
-    pool = list(itertools.product(*(LGBM_GRID[k] for k in keys)))
-    rng.shuffle(pool)
-    pool = pool[:n_draws]
-    best_score  = -np.inf
-    best_params = {"n_estimators": 300, "learning_rate": 0.05, "max_depth": 3,
-                   "num_leaves": 15, "min_child_samples": 30, "subsample": 0.8,
-                   "colsample_bytree": 0.9, "reg_lambda": 5.0}
-    for idx, combo in enumerate(pool, start=1):
-        params = dict(zip(keys, combo))
-        try:
-            oof_p, oof_r = oof_lgbm_ipcw(X_arr, y, params, splitter,
-                                          seeds=[RANDOM_STATE])
-        except Exception:
-            continue
-        rows = []
-        for tr_i, va_i in splitter.split(np.arange(len(y)), y["event"].astype(int)):
-            m = metric(y[tr_i], y[va_i], oof_p[va_i], oof_r[va_i])
-            if not np.isnan(m.get("h", np.nan)):
-                rows.append(m)
-        if not rows:
-            continue
-        score = float(np.mean([m["h"] for m in rows]))
-        c_m   = float(np.mean([m["c"] for m in rows]))
-        wb_m  = float(np.mean([m["wb"] for m in rows]))
-        print(f"  [IPCW {idx:02d}/{n_draws}] h={score:.4f} C={c_m:.4f} WB={wb_m:.4f}")
-        if score > best_score:
-            best_score  = score
-            best_params = params
-            print(f"    *** New best: {params}")
-    print(f"\n  Best IPCW h={best_score:.4f}  params={best_params}")
-    return best_params, best_score
-
-# ─── Survival model search ────────────────────────────────────────────────────
-
-MODEL_SPACE = [
-    {"name": "GBSA", "cls": GradientBoostingSurvivalAnalysis,
-     "grid": {"n_estimators": [100,150,200,300,400,500],
-              "learning_rate": [0.03,0.05,0.08,0.1,0.12],
-              "max_depth": [2,3,4], "subsample": [0.6,0.7,0.8,0.9,1.0],
-              "min_samples_leaf": [5,8,10,15,20]},
-     "fixed": {"random_state": RANDOM_STATE},
-     "stage_a_draws": 20, "stage_b_topk": 4, "scale": False},
-    {"name": "RSF", "cls": RandomSurvivalForest,
-     "grid": {"n_estimators": [200,300,500], "max_depth": [7,10,15,None],
-              "min_samples_leaf": [2,3,5], "max_features": [0.25,0.3,0.4,0.5]},
-     "fixed": {"random_state": RANDOM_STATE, "n_jobs": 2},
-     "stage_a_draws": 15, "stage_b_topk": 3, "scale": False},
-    {"name": "ExtraTrees", "cls": ExtraSurvivalTrees,
-     "grid": {"n_estimators": [300,500], "max_depth": [10,15,None],
-              "min_samples_leaf": [2,3,5], "max_features": [0.5,0.7,0.9]},
-     "fixed": {"random_state": RANDOM_STATE, "n_jobs": 2},
-     "stage_a_draws": 10, "stage_b_topk": 2, "scale": False},
-]
 
 def _draw(grid, n, rng):
     keys = list(grid)
@@ -348,342 +247,844 @@ def _draw(grid, n, rng):
     rng.shuffle(pool)
     return [dict(zip(keys, c)) for c in pool[:n]]
 
-def robust_score(mean_h, std_h):
-    return mean_h - 0.30 * std_h
 
-def evaluate_config(X, y, cls, params, splitter, seeds, scale=False):
-    fold_metrics = []
-    for tr_i, va_i in splitter.split(X, y["event"]):
-        pred_acc = np.zeros((len(va_i), 4))
-        risk_acc = np.zeros(len(va_i))
-        for seed in seeds:
-            par = dict(params)
-            if "random_state" in par: par["random_state"] = seed
-            Xtr, Xva = X.iloc[tr_i].copy(), X.iloc[va_i].copy()
-            if scale:
-                sc   = StandardScaler()
-                cols = Xtr.columns
-                Xtr  = pd.DataFrame(sc.fit_transform(Xtr), columns=cols, index=Xtr.index)
-                Xva  = pd.DataFrame(sc.transform(Xva),     columns=cols, index=Xva.index)
+# ═══════════════════════════════════════════════════════════════════════
+# Feature selection  (EXACT v8 — n_keep=55)
+# ═══════════════════════════════════════════════════════════════════════
+
+def select_features(X, y_surv, n_keep=55):
+    imp_acc = np.zeros(X.shape[1])
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    for seed in [42, 123, 789]:
+        for tr_i, _ in skf.split(X, y_surv["event"]):
+            m = GradientBoostingSurvivalAnalysis(
+                n_estimators=150, max_depth=3, learning_rate=0.1,
+                subsample=0.8, min_samples_leaf=5, random_state=seed,
+            )
+            m.fit(X.iloc[tr_i], y_surv[tr_i])
+            imp_acc += m.feature_importances_
+    ranked = np.argsort(imp_acc)[::-1]
+    keep = list(X.columns[ranked[:n_keep]])
+    print(f"  Feature selection: kept {len(keep)}/{X.shape[1]} features")
+    top10 = [(X.columns[ranked[i]], imp_acc[ranked[i]]) for i in range(min(10, n_keep))]
+    for fname, fval in top10:
+        print(f"    {fname:30s} imp={fval:.4f}")
+    return keep
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PART A: Survival model OOF  (EXACT v8)
+# ═══════════════════════════════════════════════════════════════════════
+
+SURV_CONFIGS = [
+    {
+        "name": "RSF",
+        "cls": RandomSurvivalForest,
+        "grid": {
+            "n_estimators": [300, 500, 800, 1000],
+            "max_depth": [5, 7, 10, None],
+            "min_samples_leaf": [2, 3, 5, 7],
+            "max_features": [0.3, 0.5, 0.7],
+        },
+        "fixed": {"random_state": RANDOM_STATE, "n_jobs": 2},
+        "n_draw": 20,
+    },
+    {
+        "name": "GBSA",
+        "cls": GradientBoostingSurvivalAnalysis,
+        "grid": {
+            "n_estimators": [100, 150, 200, 300, 500],
+            "learning_rate": [0.03, 0.05, 0.08, 0.1, 0.12, 0.15],
+            "max_depth": [1, 2, 3, 4],
+            "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "min_samples_leaf": [3, 5, 7, 10],
+        },
+        "fixed": {"random_state": RANDOM_STATE},
+        "n_draw": 35,
+    },
+]
+
+COXPH_GRID = {"alpha": [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]}
+COXPH_N_DRAW = 7
+
+
+def surv_oof(X, y, cls, params, skf, seeds):
+    n = len(y)
+    acc_p = np.zeros((n, 4))
+    acc_r = np.zeros(n)
+    for seed in seeds:
+        par = dict(params)
+        if "random_state" in par:
+            par["random_state"] = seed
+        for tr_i, va_i in skf.split(X, y["event"]):
             m = cls(**par)
-            m.fit(Xtr, y[tr_i])
-            pred_acc += mono(sf2prob(m.predict_survival_function(Xva)))
-            risk_acc += m.predict(Xva)
-        pred_acc /= len(seeds)
-        risk_acc /= len(seeds)
-        fold_metrics.append(metric(y[tr_i], y[va_i], pred_acc, risk_acc))
-    hs  = [m["h"]  for m in fold_metrics if not np.isnan(m.get("h",  np.nan))]
-    cs  = [m["c"]  for m in fold_metrics if not np.isnan(m.get("c",  np.nan))]
-    wbs = [m["wb"] for m in fold_metrics if not np.isnan(m.get("wb", np.nan))]
-    if not hs: return None
-    return {"mean_h": float(np.mean(hs)), "std_h": float(np.std(hs)),
-            "mean_c": float(np.mean(cs)), "mean_wb": float(np.mean(wbs))}
+            m.fit(X.iloc[tr_i], y[tr_i])
+            acc_p[va_i] += mono(sf2prob(m.predict_survival_function(X.iloc[va_i])))
+            acc_r[va_i] += m.predict(X.iloc[va_i])
+    acc_p /= len(seeds)
+    acc_r /= len(seeds)
+    return acc_p, acc_r
 
-def run_adaptive_search(X, y, rng):
-    spl_a = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    spl_b = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE+17)
+
+def search_surv(X, y, bin_targets, skf, rng):
     results = []
-    for spec in MODEL_SPACE:
-        print(f"\n{'='*60}\nModel: {spec['name']}\n{'='*60}")
-        candidates = _draw(spec["grid"], spec["stage_a_draws"], rng)
-        a_rows, best_a = [], -np.inf
-        for idx, combo in enumerate(candidates, start=1):
-            params = {**spec["fixed"], **combo}
-            out    = evaluate_config(X, y, spec["cls"], params, spl_a,
-                                     [RANDOM_STATE], scale=spec["scale"])
-            if out is None: continue
-            rs     = robust_score(out["mean_h"], out["std_h"])
-            best_a = max(best_a, rs)
-            a_rows.append({"params": params, **out, "robust": rs})
-            print(f"  [A {idx:02d}] h={out['mean_h']:.4f}+-{out['std_h']:.4f} "
-                  f"C={out['mean_c']:.4f} WB={out['mean_wb']:.4f} rs={rs:.4f}")
-        a_rows.sort(key=lambda r: r["robust"], reverse=True)
-        topk = a_rows[:spec["stage_b_topk"]]
-        if not topk: continue
-        print(f"\n  Stage-B ({len(topk)} configs)...")
-        best_b, best_entry = -np.inf, None
-        for idx, row in enumerate(topk, start=1):
-            params = row["params"]
-            out    = evaluate_config(X, y, spec["cls"], params, spl_b,
-                                     OOF_SEEDS, scale=spec["scale"])
-            if out is None: continue
-            rs = robust_score(out["mean_h"], out["std_h"])
-            print(f"  [B {idx:02d}] h={out['mean_h']:.4f}+-{out['std_h']:.4f} "
-                  f"C={out['mean_c']:.4f} WB={out['mean_wb']:.4f} rs={rs:.4f}")
-            if rs > best_b:
-                best_b     = rs
-                best_entry = {"name": spec["name"], "cls": spec["cls"],
-                              "params": params, "scale": spec["scale"],
-                              "cv_mean_h": out["mean_h"], "cv_std_h": out["std_h"],
-                              "cv_mean_c": out["mean_c"], "cv_mean_wb": out["mean_wb"],
-                              "robust": rs}
-        if best_entry is not None:
-            results.append(best_entry)
+    for cfg in SURV_CONFIGS:
+        combos = _draw(cfg["grid"], cfg["n_draw"], rng)
+        print(f"\n  Survival: {cfg['name']} ({len(combos)} configs)")
+        best_h, best = -np.inf, None
+        for i, combo in enumerate(combos, 1):
+            params = {**cfg["fixed"], **combo}
+            try:
+                oof_p, oof_r = surv_oof(X, y, cfg["cls"], params, skf, [RANDOM_STATE])
+            except Exception as e:
+                print(f"    [{i:2d}] FAIL: {e}")
+                continue
+            ms = eval_cv(y, oof_p, bin_targets, skf)
+            mh = float(np.mean([m["h"] for m in ms]))
+            sh = float(np.std([m["h"] for m in ms]))
+            tag = " ***" if mh > best_h else ""
+            print(f"    [{i:2d}] h={mh:.4f}±{sh:.4f}  C={np.mean([m['c'] for m in ms]):.4f}  WB={np.mean([m['wb'] for m in ms]):.4f}{tag}")
+            if mh > best_h:
+                best_h = mh
+                best = {"name": cfg["name"], "cls": cfg["cls"], "params": params,
+                        "oof_p": oof_p, "oof_r": oof_r, "cv": mh}
+            gc.collect()
+        if best:
+            results.append(best)
     return results
 
-def build_oof_for_model(X, y, entry, splitter):
-    n, oof_p, oof_r = len(y), np.zeros((len(y), 4)), np.zeros(len(y))
-    for tr_i, va_i in splitter.split(X, y["event"]):
-        pred_acc = np.zeros((len(va_i), 4))
-        risk_acc = np.zeros(len(va_i))
-        for seed in OOF_SEEDS:
-            par = dict(entry["params"])
-            if "random_state" in par: par["random_state"] = seed
-            Xtr, Xva = X.iloc[tr_i].copy(), X.iloc[va_i].copy()
-            if entry["scale"]:
-                sc   = StandardScaler()
-                cols = Xtr.columns
-                Xtr  = pd.DataFrame(sc.fit_transform(Xtr), columns=cols, index=Xtr.index)
-                Xva  = pd.DataFrame(sc.transform(Xva),     columns=cols, index=Xva.index)
-            m = entry["cls"](**par)
-            m.fit(Xtr, y[tr_i])
-            pred_acc += mono(sf2prob(m.predict_survival_function(Xva)))
-            risk_acc += m.predict(Xva)
-        oof_p[va_i] = pred_acc / len(OOF_SEEDS)
-        oof_r[va_i] = risk_acc / len(OOF_SEEDS)
-    return oof_p, oof_r
 
-def eval_oof(y, oof_p, oof_r, splitter):
-    rows = []
-    for tr_i, va_i in splitter.split(np.arange(len(y)), y["event"]):
-        m = metric(y[tr_i], y[va_i], oof_p[va_i], oof_r[va_i])
-        if not np.isnan(m.get("h", np.nan)): rows.append(m)
-    return rows
+def search_coxph(X, y, bin_targets, skf, rng):
+    combos = _draw(COXPH_GRID, COXPH_N_DRAW, rng)
+    print(f"\n  Survival: CoxPH ({len(combos)} configs)")
+    best_h, best = -np.inf, None
+    for i, combo in enumerate(combos, 1):
+        n = len(y)
+        oof_p = np.zeros((n, 4))
+        oof_r = np.zeros(n)
+        try:
+            for tr_i, va_i in skf.split(X, y["event"]):
+                sc = StandardScaler()
+                Xtr = sc.fit_transform(X.iloc[tr_i])
+                Xva = sc.transform(X.iloc[va_i])
+                m = CoxPHSurvivalAnalysis(alpha=combo["alpha"])
+                m.fit(Xtr, y[tr_i])
+                oof_p[va_i] = mono(sf2prob(m.predict_survival_function(Xva)))
+                oof_r[va_i] = m.predict(Xva)
+        except Exception as e:
+            print(f"    [{i:2d}] FAIL: {e}")
+            continue
+        ms = eval_cv(y, oof_p, bin_targets, skf)
+        mh = float(np.mean([m["h"] for m in ms]))
+        tag = " ***" if mh > best_h else ""
+        print(f"    [{i:2d}] a={combo['alpha']:.2f}  h={mh:.4f}  C={np.mean([m['c'] for m in ms]):.4f}{tag}")
+        if mh > best_h:
+            best_h = mh
+            best = {"name": "CoxPH", "cls": CoxPHSurvivalAnalysis,
+                    "params": combo, "oof_p": oof_p, "oof_r": oof_r,
+                    "cv": mh, "needs_scale": True}
+        gc.collect()
+    return best
 
-# ─── Blend ────────────────────────────────────────────────────────────────────
 
-def optimize_blend_weights(entries, y, splitter):
-    if len(entries) == 1: return np.array([1.0])
-    splits = list(splitter.split(np.arange(len(y)), y["event"]))
-    def obj(w_raw):
-        w = np.exp(w_raw); w /= w.sum()
-        p = mono(sum(wi * e["oof_p"] for wi, e in zip(w, entries)))
-        r = sum(wi * e["oof_r"] for wi, e in zip(w, entries))
+# ═══════════════════════════════════════════════════════════════════════
+# PART B: Binary classification OOF  (EXACT v8 — 4 models, no ETC)
+# ═══════════════════════════════════════════════════════════════════════
+
+def bin_oof_single(X, bin_targets, fit_fn, skf, seeds):
+    n = len(next(iter(bin_targets.values())))
+    acc_p = np.zeros((n, 4))
+    for seed in seeds:
+        for j, t in enumerate(PRED_TIMES):
+            yt = bin_targets[t]
+            for tr_i, va_i in skf.split(X, yt):
+                acc_p[va_i, j] += fit_fn(X.iloc[tr_i], yt[tr_i], X.iloc[va_i], seed)
+    acc_p /= len(seeds)
+    return mono(acc_p)
+
+
+def _gbc_fit(Xtr, ytr, Xva, seed, **hp):
+    m = GradientBoostingClassifier(random_state=seed, **hp)
+    m.fit(Xtr, ytr)
+    return m.predict_proba(Xva)[:, 1]
+
+
+def _xgb_fit(Xtr, ytr, Xva, seed, **hp):
+    m = xgb.XGBClassifier(
+        random_state=seed, eval_metric="logloss",
+        use_label_encoder=False, verbosity=0, n_jobs=2, **hp
+    )
+    m.fit(Xtr, ytr, verbose=False)
+    return m.predict_proba(Xva)[:, 1]
+
+
+def _lgb_fit(Xtr, ytr, Xva, seed, **hp):
+    m = lgb.LGBMClassifier(random_state=seed, verbose=-1, n_jobs=2, **hp)
+    m.fit(Xtr, ytr)
+    return m.predict_proba(Xva)[:, 1]
+
+
+def _rfc_fit(Xtr, ytr, Xva, seed, **hp):
+    m = RandomForestClassifier(random_state=seed, n_jobs=2, **hp)
+    m.fit(Xtr, ytr)
+    return m.predict_proba(Xva)[:, 1]
+
+
+BIN_CONFIGS = [
+    {
+        "name": "XGB",
+        "fit_fn": _xgb_fit,
+        "grid": {
+            "n_estimators": [100, 200, 300, 500],
+            "learning_rate": [0.01, 0.03, 0.05, 0.08, 0.1],
+            "max_depth": [2, 3, 4, 5],
+            "subsample": [0.7, 0.8, 0.9],
+            "colsample_bytree": [0.5, 0.7, 0.9],
+            "reg_alpha": [0, 0.1, 1.0],
+            "reg_lambda": [1, 3, 5],
+            "min_child_weight": [3, 5, 10],
+        },
+        "n_draw": 25,
+    },
+    {
+        "name": "LGB",
+        "fit_fn": _lgb_fit,
+        "grid": {
+            "n_estimators": [100, 200, 300, 500],
+            "learning_rate": [0.01, 0.03, 0.05, 0.08, 0.1],
+            "max_depth": [3, 4, 5, 7, -1],
+            "num_leaves": [7, 15, 31, 63],
+            "subsample": [0.6, 0.7, 0.8, 0.9],
+            "colsample_bytree": [0.5, 0.7, 0.9],
+            "reg_alpha": [0, 0.1, 0.5, 1.0],
+            "reg_lambda": [0, 1, 3, 5],
+            "min_child_samples": [5, 10, 20],
+        },
+        "n_draw": 30,
+    },
+    {
+        "name": "GBC",
+        "fit_fn": _gbc_fit,
+        "grid": {
+            "n_estimators": [100, 200, 300],
+            "learning_rate": [0.02, 0.05, 0.08, 0.1],
+            "max_depth": [2, 3, 4],
+            "subsample": [0.7, 0.8, 0.9],
+            "min_samples_leaf": [5, 10, 15],
+        },
+        "n_draw": 15,
+    },
+    {
+        "name": "RFC",
+        "fit_fn": _rfc_fit,
+        "grid": {
+            "n_estimators": [300, 500],
+            "max_depth": [5, 7, 10, None],
+            "min_samples_leaf": [3, 5, 10],
+            "max_features": [0.3, 0.5, "sqrt"],
+        },
+        "n_draw": 10,
+    },
+]
+
+
+def search_bin(X, y_surv, bin_targets, skf, rng):
+    results = []
+    for cfg in BIN_CONFIGS:
+        combos = _draw(cfg["grid"], cfg["n_draw"], rng)
+        print(f"\n  Binary: {cfg['name']} ({len(combos)} configs)")
+        best_h, best = -np.inf, None
+        for i, combo in enumerate(combos, 1):
+            try:
+                fit = lambda Xtr, ytr, Xva, seed, _hp=combo, _fn=cfg["fit_fn"]: _fn(Xtr, ytr, Xva, seed, **_hp)
+                oof_p = bin_oof_single(X, bin_targets, fit, skf, [RANDOM_STATE])
+            except Exception as e:
+                print(f"    [{i:2d}] FAIL: {e}")
+                continue
+            ms = eval_cv(y_surv, oof_p, bin_targets, skf)
+            mh = float(np.mean([m["h"] for m in ms]))
+            sh = float(np.std([m["h"] for m in ms]))
+            tag = " ***" if mh > best_h else ""
+            print(f"    [{i:2d}] h={mh:.4f}±{sh:.4f}  C={np.mean([m['c'] for m in ms]):.4f}  WB={np.mean([m['wb'] for m in ms]):.4f}{tag}")
+            if mh > best_h:
+                best_h = mh
+                best = {"name": cfg["name"], "fit_fn": cfg["fit_fn"],
+                        "params": combo, "oof_p": oof_p, "cv": mh}
+            gc.collect()
+        if best:
+            results.append(best)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PART C: Blend weight optimisation  (EXACT v8)
+# ═══════════════════════════════════════════════════════════════════════
+
+def optimise_global_blend(all_candidates, y_surv, bin_targets, skf):
+    splits = list(skf.split(np.arange(len(y_surv)), y_surv["event"]))
+
+    def objective(w_raw):
+        w = np.exp(w_raw)
+        w /= w.sum()
+        bp = mono(sum(wi * c["oof_p"] for wi, c in zip(w, all_candidates)))
         hs = []
-        for tr_i, va_i in splits:
-            m = metric(y[tr_i], y[va_i], p[va_i], r[va_i])
-            if not np.isnan(m.get("h", np.nan)): hs.append(m["h"])
-        return -float(np.mean(hs)) if hs else 0.0
-    k = len(entries)
-    best, best_val = np.zeros(k), obj(np.zeros(k))
+        for _, va_i in splits:
+            bt_va = {t: bin_targets[t][va_i] for t in PRED_TIMES}
+            m = eval_fold(y_surv[va_i], bp[va_i], bt_va)
+            hs.append(m["h"])
+        return -float(np.mean(hs))
+
+    k = len(all_candidates)
+    best_w, best_v = np.zeros(k), objective(np.zeros(k))
     for _ in range(30):
-        x0  = np.random.randn(k) * 0.7
-        res = minimize(obj, x0, method="Nelder-Mead",
-                       options={"maxiter": 2000, "xatol": 1e-7, "fatol": 1e-8})
-        if res.fun < best_val:
-            best_val, best = res.fun, res.x
-    w = np.exp(best); w /= w.sum()
+        x0 = np.random.randn(k) * 0.5
+        res = minimize(objective, x0, method="Nelder-Mead",
+                       options={"maxiter": 1000, "xatol": 1e-6, "fatol": 1e-7})
+        if res.fun < best_v:
+            best_v, best_w = res.fun, res.x
+    w = np.exp(best_w)
+    w /= w.sum()
     return w
 
-# ─── Calibration ──────────────────────────────────────────────────────────────
 
-def choose_calibration(oof_p, oof_r, y, splitter):
-    splits  = list(splitter.split(np.arange(len(y)), y["event"]))
-    targets = [(y["event"] & (y["time"] <= t)).astype(float) for t in PRED_TIMES]
-    def oof_score(p):
+def optimise_per_horizon_blend(all_oof, y_surv, bin_targets, skf):
+    splits = list(skf.split(np.arange(len(y_surv)), y_surv["event"]))
+    k = len(all_oof)
+    horizon_weights = np.zeros((4, k))
+
+    for j, t in enumerate(PRED_TIMES):
+        yt = bin_targets[t]
+
+        def objective(w_raw):
+            w = np.exp(w_raw)
+            w /= w.sum()
+            bp = np.clip(sum(wi * m[:, j] for wi, m in zip(w, all_oof)), 0, 1)
+            bs_vals = []
+            for _, va_i in splits:
+                bs_vals.append(float(np.mean((bp[va_i] - yt[va_i]) ** 2)))
+            return float(np.mean(bs_vals))
+
+        best_w, best_v = np.zeros(k), objective(np.zeros(k))
+        for _ in range(20):
+            x0 = np.random.randn(k) * 0.5
+            res = minimize(objective, x0, method="Nelder-Mead",
+                           options={"maxiter": 500, "xatol": 1e-6, "fatol": 1e-7})
+            if res.fun < best_v:
+                best_v, best_w = res.fun, res.x
+        w = np.exp(best_w)
+        w /= w.sum()
+        horizon_weights[j] = w
+
+    return horizon_weights
+
+
+def optimise_joint_hybrid_blend(all_candidates, all_oof, y_surv, bin_targets, skf):
+    splits = list(skf.split(np.arange(len(y_surv)), y_surv["event"]))
+    k = len(all_oof)
+    n_params = 4 * k
+
+    def objective(w_raw_flat):
+        w_mat = w_raw_flat.reshape(4, k)
+        for j in range(4):
+            row = np.exp(w_mat[j])
+            w_mat[j] = row / row.sum()
+        bp = np.column_stack([
+            np.clip(sum(w_mat[j, ci] * m[:, j] for ci, m in enumerate(all_oof)), 0, 1)
+            for j in range(4)
+        ])
+        bp = mono(bp)
         hs = []
+        for _, va_i in splits:
+            bt_va = {t: bin_targets[t][va_i] for t in PRED_TIMES}
+            m = eval_fold(y_surv[va_i], bp[va_i], bt_va)
+            hs.append(m["h"])
+        return -float(np.mean(hs))
+
+    best_w, best_v = np.zeros(n_params), objective(np.zeros(n_params))
+    for _ in range(40):
+        x0 = np.random.randn(n_params) * 0.3
+        res = minimize(objective, x0, method="Nelder-Mead",
+                       options={"maxiter": 3000, "xatol": 1e-7, "fatol": 1e-8})
+        if res.fun < best_v:
+            best_v, best_w = res.fun, res.x
+
+    w_mat = best_w.reshape(4, k)
+    for j in range(4):
+        row = np.exp(w_mat[j])
+        w_mat[j] = row / row.sum()
+    return w_mat
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Calibration
+# ═══════════════════════════════════════════════════════════════════════
+
+def calibrate_isotonic_cv(oof_probs, bin_targets, skf, y_surv):
+    n = oof_probs.shape[0]
+    cal_probs = oof_probs.copy()
+    splits = list(skf.split(np.arange(n), y_surv["event"]))
+    for j, t in enumerate(PRED_TIMES):
+        yt = bin_targets[t]
+        for fi, (_, va_i) in enumerate(splits):
+            tr_idx = np.concatenate([v for fj, (_, v) in enumerate(splits) if fj != fi])
+            iso = IsotonicRegression(out_of_bounds="clip", y_min=PROB_FLOOR, y_max=PROB_CEIL)
+            iso.fit(oof_probs[tr_idx, j], yt[tr_idx])
+            cal_probs[va_i, j] = iso.predict(oof_probs[va_i, j])
+    return mono(cal_probs)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PART S: LightGBM Stacking  (base probs ONLY, heavy regularisation)
+# ═══════════════════════════════════════════════════════════════════════
+
+def stack_lgb_cv(base_oof_list, bin_targets, y_surv, skf, seed=42):
+    """
+    Per-timepoint LightGBM meta-learner on base model OOF probs only.
+    Heavy regularisation to prevent overfitting the small dataset.
+    """
+    n = len(y_surv)
+    meta_oof = np.zeros((n, 4))
+
+    meta_cols = []
+    for oof in base_oof_list:
+        for j in range(4):
+            meta_cols.append(oof[:, j])
+    meta_X = np.column_stack(meta_cols)
+
+    lgb_params = {
+        "n_estimators": 200,
+        "max_depth": 3,
+        "num_leaves": 7,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 1.0,
+        "reg_lambda": 5.0,
+        "min_child_samples": 15,
+        "random_state": seed,
+        "verbose": -1,
+        "n_jobs": 2,
+    }
+
+    models_per_t = {}
+    splits = list(skf.split(np.arange(n), y_surv["event"]))
+
+    for j, t in enumerate(PRED_TIMES):
+        yt = bin_targets[t]
+        fold_models = []
         for tr_i, va_i in splits:
-            m = metric(y[tr_i], y[va_i], p[va_i], oof_r[va_i])
-            if not np.isnan(m.get("h", np.nan)): hs.append(m["h"])
-        return float(np.mean(hs)) if hs else 0.0
-    raw_score     = oof_score(oof_p)
-    clipped_score = oof_score(clip_safe(oof_p))
-    iso_p = np.zeros_like(oof_p)
-    for fi, (_, va_i) in enumerate(splits):
-        tri = np.concatenate([v for j, (_, v) in enumerate(splits) if j != fi])
-        for t in range(4):
-            ir = IsotonicRegression(y_min=PROB_FLOOR, y_max=PROB_CEIL, out_of_bounds="clip")
-            ir.fit(oof_p[tri, t], targets[t][tri])
-            iso_p[va_i, t] = ir.transform(oof_p[va_i, t])
-    iso_score = oof_score(clip_safe(iso_p))
-    platt_p = np.zeros_like(oof_p)
-    for fi, (_, va_i) in enumerate(splits):
-        tri = np.concatenate([v for j, (_, v) in enumerate(splits) if j != fi])
-        for t in range(4):
-            lr = LogisticRegression(C=1.0, max_iter=1000)
-            lr.fit(oof_p[tri, t:t+1], targets[t][tri])
-            platt_p[va_i, t] = lr.predict_proba(oof_p[va_i, t:t+1])[:, 1]
-    platt_score = oof_score(clip_safe(platt_p))
-    scores    = {"none": raw_score, "clipped": clipped_score,
-                 "isotonic": iso_score, "platt": platt_score}
-    best_name = max(scores, key=scores.get)
-    if best_name == "isotonic":
-        cal = [IsotonicRegression(y_min=PROB_FLOOR, y_max=PROB_CEIL, out_of_bounds="clip")
-               for _ in range(4)]
-        for t in range(4): cal[t].fit(oof_p[:, t], targets[t])
-        calibrator = ("isotonic", cal)
-    elif best_name == "platt":
-        cal = [LogisticRegression(C=1.0, max_iter=1000) for _ in range(4)]
-        for t in range(4): cal[t].fit(oof_p[:, t:t+1], targets[t])
-        calibrator = ("platt", cal)
-    elif best_name == "clipped":
-        calibrator = ("clipped", None)
-    else:
-        calibrator = ("none", None)
-    return {"best_name": best_name, "scores": scores, "calibrator": calibrator}
+            m = lgb.LGBMClassifier(**lgb_params)
+            m.fit(meta_X[tr_i], yt[tr_i])
+            meta_oof[va_i, j] = m.predict_proba(meta_X[va_i])[:, 1]
+            fold_models.append(m)
+        models_per_t[j] = fold_models
 
-def apply_calibration(p, calibrator):
-    name, obj = calibrator
-    if name == "none":     return p
-    if name == "clipped":  return clip_safe(p)
-    if name == "isotonic": return clip_safe(np.column_stack([obj[j].transform(p[:, j]) for j in range(4)]))
-    return clip_safe(np.column_stack([obj[j].predict_proba(p[:, j:j+1])[:, 1] for j in range(4)]))
+    meta_oof = mono(meta_oof)
+    return meta_oof, models_per_t
 
-# ─── Final test helpers ───────────────────────────────────────────────────────
 
-def fit_predict_test_model(entry, X, y, Xt):
+def stack_predict_test(models_per_t, base_test_list):
+    meta_cols = []
+    for tp in base_test_list:
+        for j in range(4):
+            meta_cols.append(tp[:, j])
+    meta_X = np.column_stack(meta_cols)
+
+    n = len(meta_X)
+    preds = np.zeros((n, 4))
+    for j in range(4):
+        for m in models_per_t[j]:
+            preds[:, j] += m.predict_proba(meta_X)[:, 1]
+        preds[:, j] /= len(models_per_t[j])
+    return mono(preds)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Final test predictions
+# ═══════════════════════════════════════════════════════════════════════
+
+def predict_surv_test(entry, X, y, Xt):
     preds = []
     for seed in FINAL_SEEDS:
         par = dict(entry["params"])
-        if "random_state" in par: par["random_state"] = seed
-        if "n_jobs" in par:       par["n_jobs"] = 2
-        Xtr, Xte = X.copy(), Xt.copy()
-        if entry["scale"]:
-            sc = StandardScaler(); cols = Xtr.columns
-            Xtr = pd.DataFrame(sc.fit_transform(Xtr), columns=cols)
-            Xte = pd.DataFrame(sc.transform(Xte),     columns=cols)
+        if "random_state" in par:
+            par["random_state"] = seed
+        if "n_jobs" in par:
+            par["n_jobs"] = 2
         m = entry["cls"](**par)
-        m.fit(Xtr, y)
-        preds.append(mono(sf2prob(m.predict_survival_function(Xte))))
+        m.fit(X, y)
+        preds.append(mono(sf2prob(m.predict_survival_function(Xt))))
     return np.mean(preds, axis=0)
 
-def write_submission(path, ids, probs):
-    sub = pd.DataFrame({ID_COL: ids, "prob_12h": probs[:, 0],
-                        "prob_24h": probs[:, 1], "prob_48h": probs[:, 2],
-                        "prob_72h": probs[:, 3]})
+
+def predict_bin_test(entry, X, bin_targets, Xt):
+    preds = np.zeros((len(Xt), 4))
+    for seed in FINAL_SEEDS:
+        for j, t in enumerate(PRED_TIMES):
+            yt = bin_targets[t]
+            preds[:, j] += entry["fit_fn"](X, yt, Xt, seed, **entry["params"])
+    preds /= len(FINAL_SEEDS)
+    return mono(preds)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Submission
+# ═══════════════════════════════════════════════════════════════════════
+
+def write_sub(path, ids, probs):
+    sub = pd.DataFrame({
+        ID_COL: ids,
+        "prob_12h": probs[:, 0], "prob_24h": probs[:, 1],
+        "prob_48h": probs[:, 2], "prob_72h": probs[:, 3],
+    })
     sample = pd.read_csv(SAMPLE_P)
     assert len(sub) == len(sample) and set(sub[ID_COL]) == set(sample[ID_COL])
-    sub.sort_values(ID_COL).reset_index(drop=True).to_csv(path, index=False)
-    return pd.read_csv(path)
+    sub = sub.sort_values(ID_COL).reset_index(drop=True)
+    sub.to_csv(path, index=False)
+    return sub
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
 
 def main():
     sys.stdout.reconfigure(line_buffering=True)
-    t0 = time.time()
+    start = time.time()
     np.random.seed(RANDOM_STATE)
     rng = np.random.default_rng(RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
-    X, Xt, y, tids = load_data()
-    X_arr, Xt_arr  = X.values.astype(float), Xt.values.astype(float)
-    base_spl = StratifiedKFold(n_splits=N_FOLDS, shuffle=True,
-                                random_state=RANDOM_STATE)
-    print("=== Data ===")
-    print(f"  Train: {X.shape[0]} rows, {X.shape[1]} features")
-    print(f"  Test : {Xt.shape[0]} rows  |  Events: {int(y['event'].sum())}")
+    print("Loading data …")
+    X_full, Xt_full, y_surv, tids, train_df = load_data()
+    bin_targets = make_binary_targets(train_df)
+    print(f"  Train : {X_full.shape[0]} × {X_full.shape[1]} features")
+    print(f"  Test  : {Xt_full.shape[0]} rows")
+    print(f"  Events: {int(y_surv['event'].sum())} / {len(y_surv)}")
+    for t in PRED_TIMES:
+        print(f"  Positives at {int(t)}h: {int(bin_targets[t].sum())}")
 
-    # 1. Survival model search
-    print("\n=== Adaptive Survival Model Search ===")
-    searched = run_adaptive_search(X, y, rng)
-    searched.sort(key=lambda e: e["robust"], reverse=True)
-    if not searched:
-        raise RuntimeError("No valid survival model candidate found.")
-    selected = searched[:3]
-    print("\nSelected:")
-    for e in selected:
-        shown = {k: v for k, v in e["params"].items()
-                 if k not in ("random_state", "n_jobs")}
-        print(f"  {e['name']}: h={e['cv_mean_h']:.4f}  rs={e['robust']:.4f}  {shown}")
+    print("\nFeature selection …")
+    keep = select_features(X_full, y_surv, n_keep=55)
+    X = X_full[keep].copy()
+    Xt = Xt_full[keep].copy()
 
-    # 2. IPCW-LGB search
-    print("\n=== IPCW-LGB Hyperparameter Search ===")
-    lgbm_params, lgbm_cv_h = search_lgbm_ipcw(X_arr, y, base_spl, n_draws=25)
+    # ── PART A ────────────────────────────────────────────────────────
+    print("\n" + "=" * 64)
+    print("PART A: Survival Model Search (direct-MSE metric)")
+    print("=" * 64)
+    surv_results = search_surv(X, y_surv, bin_targets, skf, rng)
+    gc.collect()
 
-    # 3. Build OOF for all models
-    print("\n=== Build Multi-Seed OOF ===")
-    for e in selected:
-        print(f"  {e['name']}...")
-        e["oof_p"], e["oof_r"] = build_oof_for_model(X, y, e, base_spl)
-        fm = eval_oof(y, e["oof_p"], e["oof_r"], base_spl)
-        print(f"    h={np.mean([m['h'] for m in fm]):.4f} "
-              f"C={np.mean([m['c'] for m in fm]):.4f} "
-              f"WB={np.mean([m['wb'] for m in fm]):.4f}")
+    # ── PART B ────────────────────────────────────────────────────────
+    print("\n" + "=" * 64)
+    print("PART B: Binary Classifier Search (direct-MSE metric)")
+    print("=" * 64)
+    bin_results = search_bin(X, y_surv, bin_targets, skf, rng)
+    gc.collect()
 
-    print("  IPCW-LGB...")
-    lgbm_oof_p, lgbm_oof_r = oof_lgbm_ipcw(X_arr, y, lgbm_params, base_spl,
-                                             seeds=OOF_SEEDS)
-    lgbm_fm = eval_oof(y, lgbm_oof_p, lgbm_oof_r, base_spl)
-    lgbm_h   = float(np.mean([m["h"]  for m in lgbm_fm]))
-    lgbm_c   = float(np.mean([m["c"]  for m in lgbm_fm]))
-    lgbm_wb  = float(np.mean([m["wb"] for m in lgbm_fm]))
-    lgbm_std = float(np.std([m["h"]   for m in lgbm_fm]))
-    print(f"    h={lgbm_h:.4f} C={lgbm_c:.4f} WB={lgbm_wb:.4f}")
+    # ── Multi-seed OOF refinement ─────────────────────────────────────
+    refine_seeds = [42, 123, 789]
+    print(f"\nMulti-seed OOF refinement ({len(refine_seeds)} seeds) …")
+    for r in surv_results:
+        if r.get("needs_scale"):
+            print(f"  Refining {r['name']} (scaled) …")
+            n = len(y_surv)
+            oof_p = np.zeros((n, 4))
+            oof_r = np.zeros(n)
+            for seed in refine_seeds:
+                for tr_i, va_i in skf.split(X, y_surv["event"]):
+                    sc = StandardScaler()
+                    Xtr = sc.fit_transform(X.iloc[tr_i])
+                    Xva = sc.transform(X.iloc[va_i])
+                    m = CoxPHSurvivalAnalysis(**r["params"])
+                    m.fit(Xtr, y_surv[tr_i])
+                    oof_p[va_i] += mono(sf2prob(m.predict_survival_function(Xva)))
+                    oof_r[va_i] += m.predict(Xva)
+            r["oof_p"] = oof_p / len(refine_seeds)
+            r["oof_r"] = oof_r / len(refine_seeds)
+        else:
+            print(f"  Refining {r['name']} …")
+            r["oof_p"], r["oof_r"] = surv_oof(X, y_surv, r["cls"], r["params"], skf, refine_seeds)
+        gc.collect()
+    for r in bin_results:
+        print(f"  Refining {r['name']} …")
+        fit = lambda Xtr, ytr, Xva, seed, _hp=r["params"], _fn=r["fit_fn"]: _fn(Xtr, ytr, Xva, seed, **_hp)
+        r["oof_p"] = bin_oof_single(X, bin_targets, fit, skf, refine_seeds)
+        gc.collect()
 
-    ipcw_entry = {"name": "IPCW-LGB", "oof_p": lgbm_oof_p, "oof_r": lgbm_oof_r,
-                  "cv_mean_h": lgbm_h, "cv_std_h": lgbm_std,
-                  "cv_mean_c": lgbm_c, "cv_mean_wb": lgbm_wb,
-                  "robust": robust_score(lgbm_h, lgbm_std)}
-    all_entries = selected + [ipcw_entry]
+    # ── Summary ───────────────────────────────────────────────────────
+    print(f"\n{'#' * 64}")
+    print("Base model summary (direct-MSE + prob_72h C-index):")
+    for r in surv_results:
+        ms = eval_cv(y_surv, r["oof_p"], bin_targets, skf)
+        mh = np.mean([m["h"] for m in ms])
+        mc = np.mean([m["c"] for m in ms])
+        mwb = np.mean([m["wb"] for m in ms])
+        p = {k: v for k, v in r["params"].items() if k not in ("random_state", "n_jobs")}
+        print(f"  [surv] {r['name']:6s}  h={mh:.4f}  C={mc:.4f}  WB={mwb:.4f}  {p}")
+    for r in bin_results:
+        ms = eval_cv(y_surv, r["oof_p"], bin_targets, skf)
+        mh = np.mean([m["h"] for m in ms])
+        mc = np.mean([m["c"] for m in ms])
+        mwb = np.mean([m["wb"] for m in ms])
+        print(f"  [bin]  {r['name']:6s}  h={mh:.4f}  C={mc:.4f}  WB={mwb:.4f}  {r['params']}")
+    print(f"{'#' * 64}")
 
-    # 4. Blend optimisation
-    print("\n=== Blend Optimisation ===")
-    weights = optimize_blend_weights(all_entries, y, base_spl)
-    print("Blend weights:")
-    for e, w in zip(all_entries, weights):
-        print(f"  {e['name']}: {w:.4f}")
-    blend_oof   = mono(sum(w * e["oof_p"] for w, e in zip(weights, all_entries)))
-    blend_oof_r = sum(w * e["oof_r"]      for w, e in zip(weights, all_entries))
-    bm = eval_oof(y, blend_oof, blend_oof_r, base_spl)
-    b_mean = float(np.mean([m["h"]  for m in bm]))
-    b_std  = float(np.std([m["h"]   for m in bm]))
-    b_c    = float(np.mean([m["c"]  for m in bm]))
-    b_wb   = float(np.mean([m["wb"] for m in bm]))
-    print(f"Blend CV: h={b_mean:.4f}+-{b_std:.4f}  C={b_c:.4f}  WB={b_wb:.4f}")
+    # ── PART C: Global blend ──────────────────────────────────────────
+    print("\nPART C: Global blend optimisation (hybrid = C-index + Brier) …")
+    all_candidates = []
+    for r in surv_results:
+        all_candidates.append(r)
+    for r in bin_results:
+        all_candidates.append({"oof_p": r["oof_p"], "name": r["name"], "cv": r["cv"]})
 
-    # 5. Calibration
-    print("\n=== Calibration Selection ===")
-    cal = choose_calibration(blend_oof, blend_oof_r, y, base_spl)
-    print("Scores:", {k: round(v, 4) for k, v in cal["scores"].items()})
-    print(f"Chosen: {cal['best_name']}")
+    g_weights = optimise_global_blend(all_candidates, y_surv, bin_targets, skf)
+    print("  Global blend weights:")
+    for c, w in zip(all_candidates, g_weights):
+        print(f"    {c['name']:6s}  w={w:.4f}")
 
-    # 6. Final test predictions
-    print("\n=== Final Test Predictions ===")
-    surv_test = [fit_predict_test_model(e, X, y, Xt) for e in selected]
-    ipcw_test  = fit_predict_ipcw_test(X_arr, y, Xt_arr, lgbm_params)
-    surv_w, ipcw_w = weights[:len(selected)], weights[len(selected)]
-    blend_test = mono(sum(w * p for w, p in zip(surv_w, surv_test)) + ipcw_w * ipcw_test)
-    blend_cal  = apply_calibration(blend_test, cal["calibrator"])
-    final_test = clip_safe(blend_cal)
+    g_blend_oof = mono(sum(w * c["oof_p"] for w, c in zip(g_weights, all_candidates)))
+    gms = eval_cv(y_surv, g_blend_oof, bin_targets, skf)
+    g_h = float(np.mean([m["h"] for m in gms]))
+    print(f"  Global blend CV: h={g_h:.4f}  C={np.mean([m['c'] for m in gms]):.4f}  WB={np.mean([m['wb'] for m in gms]):.4f}")
 
-    # 7. Write submissions
-    sub = write_submission(DATA_DIR / "submission.csv", tids, final_test)
-    write_submission(DATA_DIR / "submission_blend.csv", tids, blend_test)
-    mono_ok = ((sub["prob_12h"] <= sub["prob_24h"] + 1e-9).all()
-               and (sub["prob_24h"] <= sub["prob_48h"] + 1e-9).all()
-               and (sub["prob_48h"] <= sub["prob_72h"] + 1e-9).all())
-    print("\nSubmission stats:")
-    for col in ["prob_12h", "prob_24h", "prob_48h", "prob_72h"]:
-        v = sub[col]
-        print(f"  {col}: min={v.min():.4f}  mean={v.mean():.4f}  max={v.max():.4f}")
-    print(f"  monotonic_ok={mono_ok}")
+    # ── Per-horizon Brier blend ───────────────────────────────────────
+    all_oof = [c["oof_p"] for c in all_candidates]
+    h_weights = optimise_per_horizon_blend(all_oof, y_surv, bin_targets, skf)
 
-    # 8. Manifest
+    h_blend_oof = np.column_stack([
+        np.clip(sum(h_weights[j, ci] * c["oof_p"][:, j] for ci, c in enumerate(all_candidates)), 0, 1)
+        for j in range(4)
+    ])
+    h_blend_oof = mono(h_blend_oof)
+    hms = eval_cv(y_surv, h_blend_oof, bin_targets, skf)
+    h_h = float(np.mean([m["h"] for m in hms]))
+    print(f"  Per-horizon Brier CV: h={h_h:.4f}")
+
+    # ── Joint hybrid blend ────────────────────────────────────────────
+    jh_weights = optimise_joint_hybrid_blend(all_candidates, all_oof, y_surv, bin_targets, skf)
+    jh_blend_oof = np.column_stack([
+        np.clip(sum(jh_weights[j, ci] * c["oof_p"][:, j] for ci, c in enumerate(all_candidates)), 0, 1)
+        for j in range(4)
+    ])
+    jh_blend_oof = mono(jh_blend_oof)
+    jhms = eval_cv(y_surv, jh_blend_oof, bin_targets, skf)
+    jh_h = float(np.mean([m["h"] for m in jhms]))
+    print(f"  Joint hybrid CV: h={jh_h:.4f}")
+
+    # ── Custom hybrid: Brier for 12/24/48h, global for 72h ───────────
+    custom_oof = np.column_stack([
+        np.clip(sum(h_weights[j, ci] * c["oof_p"][:, j] for ci, c in enumerate(all_candidates)), 0, 1)
+        for j in range(3)
+    ] + [
+        g_blend_oof[:, 3]
+    ])
+    custom_oof = mono(custom_oof)
+    custom_ms = eval_cv(y_surv, custom_oof, bin_targets, skf)
+    custom_h = float(np.mean([m["h"] for m in custom_ms]))
+    print(f"  Custom hybrid CV: h={custom_h:.4f}")
+
+    # ── PART S: LightGBM Stacking ─────────────────────────────────────
+    print("\n" + "=" * 64)
+    print("PART S: LightGBM Stacking (base probs only, heavy regularisation)")
+    print("=" * 64)
+
+    base_oof_list = [c["oof_p"] for c in all_candidates]
+
+    stack_seeds = [42, 123, 789]
+    stack_oof_acc = np.zeros((len(y_surv), 4))
+    all_stack_models = []
+
+    for si, sseed in enumerate(stack_seeds):
+        print(f"  Stack seed {si+1}/{len(stack_seeds)} (seed={sseed}) …")
+        soof, smodels = stack_lgb_cv(base_oof_list, bin_targets, y_surv, skf, seed=sseed)
+        stack_oof_acc += soof
+        all_stack_models.append(smodels)
+        ms = eval_cv(y_surv, soof, bin_targets, skf)
+        sh = float(np.mean([m["h"] for m in ms]))
+        print(f"    h={sh:.4f}  C={np.mean([m['c'] for m in ms]):.4f}  WB={np.mean([m['wb'] for m in ms]):.4f}")
+
+    stack_oof = mono(stack_oof_acc / len(stack_seeds))
+    sms = eval_cv(y_surv, stack_oof, bin_targets, skf)
+    stack_h = float(np.mean([m["h"] for m in sms]))
+    print(f"\n  Multi-seed stack CV: h={stack_h:.4f}  C={np.mean([m['c'] for m in sms]):.4f}  WB={np.mean([m['wb'] for m in sms]):.4f}")
+
+    # ── Stack + blend mixing ──────────────────────────────────────────
+    print("\nStack + blend mixing …")
+    best_alpha, best_alpha_h = 1.0, stack_h
+    for alpha in np.arange(0.5, 1.01, 0.05):
+        combo = mono(alpha * stack_oof + (1 - alpha) * g_blend_oof)
+        cms = eval_cv(y_surv, combo, bin_targets, skf)
+        ch = float(np.mean([m["h"] for m in cms]))
+        tag = " ***" if ch > best_alpha_h else ""
+        print(f"  α={alpha:.2f}  h={ch:.4f}{tag}")
+        if ch > best_alpha_h:
+            best_alpha_h = ch
+            best_alpha = alpha
+    stack_blend_oof = mono(best_alpha * stack_oof + (1 - best_alpha) * g_blend_oof)
+    print(f"  Best α={best_alpha:.2f}  h={best_alpha_h:.4f}")
+
+    # ── Calibration ───────────────────────────────────────────────────
+    print("\nCalibration evaluation …")
+    approaches = {}
+    approaches["global"] = (g_h, g_blend_oof, "global")
+    approaches["per-horizon-brier"] = (h_h, h_blend_oof, "ph_brier")
+    approaches["joint-hybrid"] = (jh_h, jh_blend_oof, "joint")
+    approaches["custom-hybrid"] = (custom_h, custom_oof, "custom")
+    approaches["stack"] = (stack_h, stack_oof, "stack")
+    approaches["stack+blend"] = (best_alpha_h, stack_blend_oof, "stackblend")
+
+    for tag, base_oof in [("global", g_blend_oof), ("joint-hybrid", jh_blend_oof)]:
+        cal = calibrate_isotonic_cv(base_oof, bin_targets, skf, y_surv)
+        cms = eval_cv(y_surv, cal, bin_targets, skf)
+        cal_h = float(np.mean([m["h"] for m in cms]))
+        approaches[f"{tag}+isotonic"] = (cal_h, cal, "cal")
+        print(f"  {tag}+isotonic: h={cal_h:.4f}")
+
+    for r in surv_results:
+        ms = eval_cv(y_surv, r["oof_p"], bin_targets, skf)
+        approaches[f"single-{r['name']}"] = (float(np.mean([m["h"] for m in ms])), r["oof_p"], "single")
+    for r in bin_results:
+        ms = eval_cv(y_surv, r["oof_p"], bin_targets, skf)
+        approaches[f"single-{r['name']}"] = (float(np.mean([m["h"] for m in ms])), r["oof_p"], "single")
+
+    best_tag = max(approaches, key=lambda k: approaches[k][0])
+    best_h_val = approaches[best_tag][0]
+    print(f"\n  Best approach: {best_tag} (h={best_h_val:.4f})")
+    sorted_app = sorted(approaches.items(), key=lambda x: -x[1][0])
+    for tag, (h, _, _t) in sorted_app:
+        print(f"    {tag:30s}  h={h:.4f}")
+
+    # ── Final test predictions ────────────────────────────────────────
+    print(f"\nFinal predictions ({len(FINAL_SEEDS)} seeds) …")
+    surv_test_preds = []
+    for r in surv_results:
+        if r.get("needs_scale"):
+            print(f"  Predicting {r['name']} (scaled) …")
+            preds = []
+            for seed in FINAL_SEEDS:
+                sc = StandardScaler()
+                Xsc = sc.fit_transform(X)
+                Xtsc = sc.transform(Xt)
+                m = CoxPHSurvivalAnalysis(**r["params"])
+                m.fit(Xsc, y_surv)
+                preds.append(mono(sf2prob(m.predict_survival_function(Xtsc))))
+            surv_test_preds.append(np.mean(preds, axis=0))
+        else:
+            print(f"  Predicting {r['name']} …")
+            p = predict_surv_test(r, X, y_surv, Xt)
+            surv_test_preds.append(p)
+        gc.collect()
+
+    bin_test_preds = []
+    for r in bin_results:
+        print(f"  Predicting {r['name']} …")
+        p = predict_bin_test(r, X, bin_targets, Xt)
+        bin_test_preds.append(p)
+        gc.collect()
+
+    all_test = surv_test_preds + bin_test_preds
+
+    g_test = mono(sum(w * p for w, p in zip(g_weights, all_test)))
+
+    jh_test = np.column_stack([
+        np.clip(sum(jh_weights[j, ci] * p[:, j] for ci, p in enumerate(all_test)), 0, 1)
+        for j in range(4)
+    ])
+    jh_test = mono(jh_test)
+
+    h_test = np.column_stack([
+        np.clip(sum(h_weights[j, ci] * p[:, j] for ci, p in enumerate(all_test)), 0, 1)
+        for j in range(4)
+    ])
+    h_test = mono(h_test)
+
+    custom_test = np.column_stack([
+        np.clip(sum(h_weights[j, ci] * p[:, j] for ci, p in enumerate(all_test)), 0, 1)
+        for j in range(3)
+    ] + [g_test[:, 3]])
+    custom_test = mono(custom_test)
+
+    # Stack test
+    print("  Stack test predictions …")
+    stack_test_acc = np.zeros((len(Xt), 4))
+    for smodels in all_stack_models:
+        st = stack_predict_test(smodels, all_test)
+        stack_test_acc += st
+    stack_test = mono(stack_test_acc / len(all_stack_models))
+
+    stack_blend_test = mono(best_alpha * stack_test + (1 - best_alpha) * g_test)
+
+    # Determine main submission
+    if best_tag == "stack":
+        main_probs = stack_test
+    elif best_tag == "stack+blend":
+        main_probs = stack_blend_test
+    elif best_tag == "global":
+        main_probs = g_test
+    elif best_tag == "joint-hybrid":
+        main_probs = jh_test
+    elif best_tag == "custom-hybrid":
+        main_probs = custom_test
+    elif best_tag == "global+isotonic":
+        cal_test = g_test.copy()
+        for j, t in enumerate(PRED_TIMES):
+            iso = IsotonicRegression(out_of_bounds="clip", y_min=PROB_FLOOR, y_max=PROB_CEIL)
+            iso.fit(g_blend_oof[:, j], bin_targets[t])
+            cal_test[:, j] = iso.predict(g_test[:, j])
+        main_probs = mono(cal_test)
+    else:
+        main_probs = g_test
+
+    main_probs = clip_safe(main_probs)
+    sub_main = write_sub(DATA_DIR / "submission.csv", tids, main_probs)
+    write_sub(DATA_DIR / "submission_blend.csv", tids, clip_safe(g_test))
+    write_sub(DATA_DIR / "submission_stack.csv", tids, clip_safe(stack_test))
+    write_sub(DATA_DIR / "submission_stack_blend.csv", tids, clip_safe(stack_blend_test))
+    write_sub(DATA_DIR / "submission_jh.csv", tids, clip_safe(jh_test))
+    write_sub(DATA_DIR / "submission_custom.csv", tids, clip_safe(custom_test))
+
+    elapsed = time.time() - start
+    print(f"\nDone in {elapsed / 60:.1f} minutes")
+    print(f"\nSubmission stats (submission.csv — {best_tag}):")
+    for c in ["prob_12h", "prob_24h", "prob_48h", "prob_72h"]:
+        v = sub_main[c]
+        print(f"  {c}: min={v.min():.4f}  mean={v.mean():.4f}  max={v.max():.4f}")
+
+    ok = all(
+        (sub_main[a] <= sub_main[b] + 1e-9).all()
+        for a, b in [("prob_12h", "prob_24h"), ("prob_24h", "prob_48h"), ("prob_48h", "prob_72h")]
+    )
+    print(f"  Monotonicity: {'OK' if ok else 'FAIL'}")
+
+    print("\n" + "=" * 64)
+    print("Files generated:")
+    for fname in ["submission.csv", "submission_blend.csv", "submission_stack.csv",
+                  "submission_stack_blend.csv", "submission_jh.csv", "submission_custom.csv"]:
+        fp = DATA_DIR / fname
+        if fp.exists():
+            print(f"  {fname}")
+
     manifest = {
-        "version": "v7",
-        "runtime_seconds": round(time.time() - t0, 2),
-        "data": {"train_rows": int(X.shape[0]), "test_rows": int(Xt.shape[0]),
-                 "features": int(X.shape[1])},
-        "selected_survival_models": [
-            {"name": e["name"], "cv_mean_h": e["cv_mean_h"], "cv_std_h": e["cv_std_h"],
-             "cv_mean_c": e["cv_mean_c"], "cv_mean_wb": e["cv_mean_wb"],
-             "robust": e["robust"],
-             "params": {k: v for k, v in e["params"].items()
-                        if k not in ("random_state", "n_jobs")}}
-            for e in selected],
-        "ipcw_lgbm": {"cv_h": lgbm_h, "cv_c": lgbm_c, "cv_wb": lgbm_wb,
-                      "params": lgbm_params},
-        "blend_weights": {e["name"]: float(w) for e, w in zip(all_entries, weights)},
-        "blend_cv": {"mean_h": b_mean, "std_h": b_std, "mean_c": b_c, "mean_wb": b_wb},
-        "calibration": {"chosen": cal["best_name"], "scores": cal["scores"]},
-        "output_files": ["submission.csv", "submission_blend.csv"],
+        "version": "v8s",
+        "runtime_min": round(elapsed / 60, 1),
+        "n_features": len(keep),
+        "metric": "direct-MSE Brier (matching competition)",
+        "approaches": [(tag, round(h, 4)) for tag, (h, _, _t) in sorted_app],
+        "chosen": best_tag,
+        "chosen_cv_h": round(best_h_val, 4),
+        "stack_alpha": best_alpha,
+        "surv_models": [{"name": r["name"], "cv": round(r["cv"], 4),
+                         "params": {k: v for k, v in r["params"].items() if k not in ("random_state", "n_jobs")}}
+                        for r in surv_results],
+        "bin_models": [{"name": r["name"], "cv": round(r["cv"], 4), "params": r["params"]}
+                       for r in bin_results],
+        "global_weights": {c["name"]: round(float(w), 4) for c, w in zip(all_candidates, g_weights)},
     }
-    MANIFEST_P.write_text(json.dumps(manifest, indent=2))
-    elapsed = (time.time() - t0) / 60
-    print(f"\nTotal runtime: {elapsed:.1f} minutes")
-    print(f"\n{'='*60}")
-    print(f"FINAL CV HYBRID SCORE: {b_mean:.4f} +- {b_std:.4f}")
-    print(f"  C-index: {b_c:.4f}    Weighted Brier: {b_wb:.4f}")
-    print(f"{'='*60}")
+    (DATA_DIR / "experiment_manifest.json").write_text(json.dumps(manifest, indent=2))
+    print("Manifest → experiment_manifest.json")
+
 
 if __name__ == "__main__":
     main()
