@@ -1,6 +1,6 @@
 {
   "version": "v8",
-  "runtime_seconds": 1508.34,
+  "runtime_seconds": 913.49,
   "data": {
     "train_rows": 221,
     "test_rows": 95,
@@ -69,26 +69,33 @@
     }
   },
   "blend_weights": {
-    "IPCW-LGBM": 0.8807227140931042,
-    "IPCW-XGB": 0.027611041023233793,
-    "IPCW-CB": 0.027611041023233793,
-    "GBSA": 0.027611041023233793,
-    "RSF": 0.03644416283719437
+    "IPCW-LGBM": 0.881925104713142,
+    "IPCW-XGB": 0.0275229359179918,
+    "IPCW-CB": 0.0275229359179918,
+    "GBSA": 0.0275229359179918,
+    "RSF": 0.035506087532882584
   },
   "blend_cv": {
-    "mean_h": 0.9733658205187833,
-    "std_h": 0.012826572613745505,
+    "mean_h": 0.9733673410681822,
+    "std_h": 0.012823727703028358,
     "mean_c": 0.9543316415637909,
-    "mean_wb": 0.01847667421479117
+    "mean_wb": 0.018474502001364305
+  },
+  "stacking": {
+    "cv_h": 0.9699228056470954,
+    "cv_c": 0.9507423973447666,
+    "cv_wb": 0.02185701936619221,
+    "best_C": 0.5,
+    "use_key_feats": false
   },
   "calibration": {
     "chosen": "power",
     "scores": {
-      "none": 0.9733658205187833,
-      "clipped": 0.9733658205187833,
-      "power": 0.9736051152037104,
-      "isotonic": 0.9692206689408241,
-      "platt": 0.969213833901075
+      "none": 0.9733673410681822,
+      "clipped": 0.9733673410681822,
+      "power": 0.9736066366707427,
+      "isotonic": 0.9692203257689498,
+      "platt": 0.9692149096425405
     }
   },
   "selected_features": [
@@ -118,6 +125,8 @@
     "submission_blend.csv",
     "submission_equal.csv",
     "submission_lgbm.csv",
-    "submission_xgb.csv"
+    "submission_xgb.csv",
+    "submission_stack.csv",
+    "submission_blend_stack.csv"
   ]
 }

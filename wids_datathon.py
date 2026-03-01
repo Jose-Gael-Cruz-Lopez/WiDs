@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WiDS Global Datathon 2026 - Advanced Survival Pipeline (v8)
+WiDS Global Datathon 2026 - Advanced Survival Pipeline (v10)
 ============================================================
 Target: >=0.98 on Kaggle leaderboard
 
@@ -63,7 +63,7 @@ OPTUNA_LGBM  = 45
 OPTUNA_XGB   = 45
 OPTUNA_CB    = 30
 OPTUNA_GBSA  = 30
-BLEND_RESTARTS = 60
+BLEND_RESTARTS = 20
 
 DATA_DIR   = Path(__file__).resolve().parent
 TRAIN_P    = DATA_DIR / "train.csv"
@@ -676,6 +676,92 @@ def optimize_blend_weights(entries, y, splitter):
     return w
 
 
+# ─── Stacking Meta-Learner ──────────────────────────────────────────────────────
+
+def build_stacking(entries, y, splitter, X_key=None):
+    """Build stacking ensemble: LogisticRegression meta-learner on OOF predictions.
+
+    Simple and robust approach that learns the optimal combination of base model
+    predictions per horizon. Can optionally include key original features.
+    Returns OOF stacking predictions, fitted meta-learners, and best C."""
+    n = len(y)
+
+    # Meta-features: all model OOF predictions (n_models * 4 horizons)
+    meta = np.hstack([e["oof_p"] for e in entries])
+    if X_key is not None:
+        meta = np.hstack([meta, X_key])
+
+    # Tune C parameter via leave-fold-out
+    C_values = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
+    best_C, best_score = 1.0, -np.inf
+    splits = list(splitter.split(np.arange(n), y["event"].astype(int)))
+
+    for C in C_values:
+        oof_stack = np.zeros((n, 4))
+        for j, h in enumerate(PRED_TIMES):
+            y_h = (y["event"] & (y["time"] <= h)).astype(float)
+            for tr_i, va_i in splits:
+                if len(np.unique(y_h[tr_i])) < 2:
+                    oof_stack[va_i, j] = float(y_h[tr_i].mean())
+                    continue
+                lr = LogisticRegression(C=C, max_iter=2000, solver="lbfgs")
+                lr.fit(meta[tr_i], y_h[tr_i])
+                oof_stack[va_i, j] = lr.predict_proba(meta[va_i])[:, 1]
+        oof_stack = mono(oof_stack)
+        risk = 0.4 * oof_stack[:, 0] + 0.3 * oof_stack[:, 1] + \
+               0.2 * oof_stack[:, 2] + 0.1 * oof_stack[:, 3]
+        rows = eval_oof(y, oof_stack, risk, splitter)
+        score = float(np.mean([m["h"] for m in rows])) if rows else 0.0
+        if score > best_score:
+            best_score, best_C = score, C
+
+    # Build final OOF predictions with best C
+    stack_oof = np.zeros((n, 4))
+    for j, h in enumerate(PRED_TIMES):
+        y_h = (y["event"] & (y["time"] <= h)).astype(float)
+        for tr_i, va_i in splits:
+            if len(np.unique(y_h[tr_i])) < 2:
+                stack_oof[va_i, j] = float(y_h[tr_i].mean())
+                continue
+            lr = LogisticRegression(C=best_C, max_iter=2000, solver="lbfgs")
+            lr.fit(meta[tr_i], y_h[tr_i])
+            stack_oof[va_i, j] = lr.predict_proba(meta[va_i])[:, 1]
+    stack_oof = mono(stack_oof)
+    stack_risk = 0.4 * stack_oof[:, 0] + 0.3 * stack_oof[:, 1] + \
+                 0.2 * stack_oof[:, 2] + 0.1 * stack_oof[:, 3]
+
+    # Evaluate
+    rows = eval_oof(y, stack_oof, stack_risk, splitter)
+    s_h = float(np.mean([m["h"] for m in rows]))
+    s_c = float(np.mean([m["c"] for m in rows]))
+    s_wb = float(np.mean([m["wb"] for m in rows]))
+
+    # Train final meta-learners on full data
+    meta_learners = []
+    for j, h in enumerate(PRED_TIMES):
+        y_h = (y["event"] & (y["time"] <= h)).astype(float)
+        lr = LogisticRegression(C=best_C, max_iter=2000, solver="lbfgs")
+        lr.fit(meta, y_h)
+        meta_learners.append(lr)
+
+    return {
+        "oof_p": stack_oof, "oof_r": stack_risk,
+        "meta_learners": meta_learners, "best_C": best_C,
+        "cv_h": s_h, "cv_c": s_c, "cv_wb": s_wb,
+    }
+
+
+def predict_stacking(test_preds_list, meta_learners, X_key_test=None, **kwargs):
+    """Apply stacking meta-learners to Level-1 test predictions."""
+    meta_test = np.hstack(test_preds_list)
+    if X_key_test is not None:
+        meta_test = np.hstack([meta_test, X_key_test])
+    stack_test = np.zeros((len(meta_test), 4))
+    for j, lr in enumerate(meta_learners):
+        stack_test[:, j] = lr.predict_proba(meta_test)[:, 1]
+    return clip_safe(stack_test)
+
+
 # ─── Calibration ─────────────────────────────────────────────────────────────────
 
 def choose_calibration(oof_p, oof_r, y, splitter):
@@ -925,11 +1011,37 @@ def main():
     b_wb = float(np.mean([m["wb"] for m in bm]))
     print(f"  Blend CV: h={b_h:.4f}+-{b_std:.4f}  C={b_c:.4f}  WB={b_wb:.4f}")
 
-    # 6. Calibration
+    # 6. Stacking meta-learner
+    print(f"\n=== Stacking Meta-Learner ===")
+    # Key features for meta-learner (just the most important ones to avoid overfitting)
+    key_feat_cols = ["dist_min_ci_0_5h", "closing_speed_m_per_h", "alignment_abs",
+                     "risk_proxy", "eta_close"]
+    key_feat_cols = [c for c in key_feat_cols if c in X.columns]
+    X_key = X[key_feat_cols].values
+    Xt_key = Xt[key_feat_cols].values
+    print(f"  Key features for meta-learner: {len(key_feat_cols)}")
+
+    print("  With original features:")
+    stack_with = build_stacking(all_entries, y, base_spl, X_key=X_key)
+    print(f"    h={stack_with['cv_h']:.4f}  C={stack_with['cv_c']:.4f}  "
+          f"WB={stack_with['cv_wb']:.4f}  (C={stack_with['best_C']})")
+
+    print("  Without original features:")
+    stack_without = build_stacking(all_entries, y, base_spl, X_key=None)
+    print(f"    h={stack_without['cv_h']:.4f}  C={stack_without['cv_c']:.4f}  "
+          f"WB={stack_without['cv_wb']:.4f}  (C={stack_without['best_C']})")
+
+    # Pick the better stacking approach
+    use_key_feats = stack_with["cv_h"] >= stack_without["cv_h"]
+    stack_result = stack_with if use_key_feats else stack_without
+    print(f"  Best stacking: {'with' if use_key_feats else 'without'} features, "
+          f"h={stack_result['cv_h']:.4f}")
+
+    # 7. Calibration (on blend)
     print(f"\n=== Calibration Selection ===")
     cal = choose_calibration(blend_oof, blend_oof_r, y, base_spl)
 
-    # 7. Final test predictions
+    # 8. Final test predictions
     print(f"\n=== Final Test Predictions ({len(FINAL_SEEDS)} seeds) ===")
 
     print("  IPCW-LGBM...")
@@ -961,6 +1073,13 @@ def main():
     eq_test = mono(sum(p for p in test_preds) / len(test_preds))
     eq_test = clip_safe(eq_test)
 
+    # Stacking test predictions
+    print("  Stacking meta-learner test predictions...")
+    stack_test = predict_stacking(
+        test_preds, stack_result["meta_learners"],
+        X_key_test=Xt_key if use_key_feats else None)
+    stack_test = mono(stack_test)
+
     # 7b. Post-processing: enforce distance-based separation
     # EDA: ALL events have dist<5km, ALL censored have dist>=5km (zero overlap)
     print("\n=== Distance-Based Post-Processing ===")
@@ -973,17 +1092,34 @@ def main():
     print(f"  Close (<5km): {is_close.sum()} | Far (>=5km): {is_far.sum()}")
 
     def apply_distance_pp(preds):
-        """Post-process predictions using distance threshold."""
+        """Post-process predictions using distance-based thresholds.
+
+        Training data shows:
+          - 100% of events hit by 72h (all 69/69)
+          - 95.7% hit by 48h (66/69)
+          - 91.3% hit by 24h (63/69)
+          - 71.0% hit by 12h (49/69)
+        """
         p = preds.copy()
-        # Far samples: cap at 0.005 (essentially 0 probability)
-        p[is_far] = np.minimum(p[is_far], 0.005)
-        # Close samples: floor prob_72h at 0.92 (100% of training events hit by 72h)
-        p[is_close, 3] = np.maximum(p[is_close, 3], 0.92)
+        # Far samples: cap at very small value
+        p[is_far] = np.minimum(p[is_far], 0.001)
+        # Close samples: apply floors based on training empirical rates
+        p[is_close, 3] = np.maximum(p[is_close, 3], 0.95)   # 100% hit by 72h
+        p[is_close, 2] = np.maximum(p[is_close, 2], 0.88)   # 95.7% hit by 48h
+        # Very close samples (<1km): even stronger floors
+        very_close = is_close & (dist_arr < 1000)
+        p[very_close, 1] = np.maximum(p[very_close, 1], 0.90)  # training: 100% by 24h
+        p[very_close, 0] = np.maximum(p[very_close, 0], 0.65)  # training: 86% by 12h
         return clip_safe(p)
 
     final_test = apply_distance_pp(final_test)
     eq_test    = apply_distance_pp(eq_test)
     blend_test_pp = apply_distance_pp(clip_safe(blend_test))
+    stack_test_pp = apply_distance_pp(clip_safe(stack_test))
+
+    # Blend + Stack average (may generalize better than either alone)
+    blend_stack_avg = mono(0.5 * blend_test + 0.5 * stack_test)
+    blend_stack_pp = apply_distance_pp(clip_safe(blend_stack_avg))
 
     # Also post-process individual models
     lgbm_test_pp = apply_distance_pp(clip_safe(lgbm_test))
@@ -996,6 +1132,8 @@ def main():
     write_submission(DATA_DIR / "submission_equal.csv", tids, eq_test)
     write_submission(DATA_DIR / "submission_lgbm.csv", tids, lgbm_test_pp)
     write_submission(DATA_DIR / "submission_xgb.csv", tids, xgb_test_pp)
+    write_submission(DATA_DIR / "submission_stack.csv", tids, stack_test_pp)
+    write_submission(DATA_DIR / "submission_blend_stack.csv", tids, blend_stack_pp)
 
     mono_ok = ((sub["prob_12h"] <= sub["prob_24h"] + 1e-9).all()
                and (sub["prob_24h"] <= sub["prob_48h"] + 1e-9).all()
@@ -1025,17 +1163,25 @@ def main():
         },
         "blend_weights": {e["name"]: float(w) for e, w in zip(all_entries, weights)},
         "blend_cv": {"mean_h": b_h, "std_h": b_std, "mean_c": b_c, "mean_wb": b_wb},
+        "stacking": {
+            "cv_h": stack_result["cv_h"], "cv_c": stack_result["cv_c"],
+            "cv_wb": stack_result["cv_wb"], "best_C": stack_result["best_C"],
+            "use_key_feats": use_key_feats,
+        },
         "calibration": {"chosen": cal["best_name"], "scores": cal["scores"]},
         "selected_features": selected_cols[:20],
         "output_files": ["submission.csv", "submission_blend.csv",
                          "submission_equal.csv", "submission_lgbm.csv",
-                         "submission_xgb.csv"],
+                         "submission_xgb.csv", "submission_stack.csv",
+                         "submission_blend_stack.csv"],
     }
     MANIFEST_P.write_text(json.dumps(manifest, indent=2))
 
     print(f"\n{'=' * 60}")
-    print(f"FINAL CV HYBRID SCORE: {b_h:.4f} +- {b_std:.4f}")
+    print(f"BLEND CV HYBRID SCORE:    {b_h:.4f} +- {b_std:.4f}")
     print(f"  C-index: {b_c:.4f}    Weighted Brier: {b_wb:.4f}")
+    print(f"STACKING CV HYBRID SCORE: {stack_result['cv_h']:.4f}")
+    print(f"  C-index: {stack_result['cv_c']:.4f}    Weighted Brier: {stack_result['cv_wb']:.4f}")
     print(f"  Runtime: {elapsed / 60:.1f} minutes")
     print(f"{'=' * 60}")
 
